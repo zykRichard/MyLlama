@@ -34,6 +34,7 @@ from ...utils import (
 from .base import BaseTokenizer, BaseModel
 
 
+
 @config_dataclass
 class LlamaConfig(TransformerConfig):
     """Llama Configurations Dataclass
@@ -204,7 +205,51 @@ class LlamaModel(BaseModel):
             config (LlamaConfig): Llama configuration
         """
         super().__init__()
-        raise NotImplementedError("TODO: Assignment5 - Task1")
+        self.config = config
+        # decoder block
+        self.decode_block = TransformerDecoderBlock(config=config)
+        # TODO : add attribute related to MODEL LOADING
+        self.block_prefix = "decode_block."
+        # sublayer
+        self.vocab_emb_suffix = "vocab_embedding.weights"
+        self.final_norm_suffix = "final_norm.weights"
+        self.lm_head_suffix = "lm_head.weight"
+        
+        self.decode_layer_prefix = "decoder_layers." 
+        # attention layer
+        self.attn_midfix = "attention_layer."
+        ### sublayer
+        self.attn_RMSnorm_suffix = "attn_RMSnorm.weights"
+        self.attn_proj_midfix = "attn_proj_layer."
+        ##### qkv projection weight
+        if config.qkv_pack_format == AttnQKVPackFormat.Q_K_V:
+            self.attn_qproj_suffix = "proj_weights.q_proj"
+            self.attn_kproj_suffix = "proj_weights.k_proj"
+            self.attn_vproj_suffix = "proj_weights.v_proj"
+        elif config.qkv_pack_format == AttnQKVPackFormat.Q_KV:
+            self.attn_qproj_suffix = "proj_weights.q_proj"
+            self.attn_kvproj_suffix = "proj_weights.kv_proj"
+        elif config.qkv_pack_format == AttnQKVPackFormat.QKV:
+            self.attn_qkvproj_suffix = "proj_weights.qkv_proj"
+        self.attn_oproj_suffix = "o_proj"
+    
+        # mlp
+        self.mlp_midfix = "mlp_layer."
+        ### sublayer
+        self.mlp_RMSnorm_suffix = "mlp_RMSnorm.weights"
+        self.mlp_suffix = "mlp."
+        ##### dense / sparse feed-forward mlp layer:
+        # MoE related
+        self.route_suffix = "G"
+        self.moe_experts_midfix = "experts."
+        # dense mlp related:
+        self.gate_proj_suffix = "gate_proj"
+        self.up_proj_suffix = "up_proj"
+        self.down_proj_suffix = "down_proj"
+        # lora related:
+        self.lora_A_suffix = "lora_A"
+        self.lora_B_suffix = "lora_B"
+        
     
     def forward(
         self,
@@ -229,23 +274,43 @@ class LlamaModel(BaseModel):
                 2. for inference, the value is the next-token probability distribution for every sequence in the batch, with shape: [inferred_batch_size, vocab_size]
             NOTE: the `inferred_batch_size` is inferred from `cu_seqlens` if provided (i.e. `inner_batch_size`), otherwise from `input_ids` (i.e. `batch_size`)
         """
-        raise NotImplementedError("TODO: Assignment5 - Task1")
+        forward_context = torch.enable_grad() if self.training else torch.no_grad()
+        
+        with forward_context:
+            logits = self.decode_block(input_ids=input_ids, cu_seqlens=cu_seqlens)
+            
+        if self.training:
+            # if input is ABCD, in training mode, labels is BCD
+            # corresponding context is [A, AB, ABC]
+            # that is : A -> B, AB -> C, ABC -> D
+            logits_shift = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
+            labels_shift = labels[:, 1:].contiguous().view(-1)
+            loss = nn.CrossEntropyLoss(ignore_index=-100, reduction="mean")
+            return loss(
+                input=logits_shift,
+                target=labels_shift
+            )
+        else:
+            probs = F.softmax(logits / temperature, dim=-1)
+            return probs[:, -1, :]
+        
     
     def get_kv_cache(self) -> TransformerDecoderKVCache:
         """Get the TransformerDecoderKVCache object managing the kv cache memory"""
-        raise NotImplementedError("TODO: Assignment5 - Task1")
+        return self.decode_block.get_kv_cache()
     
     def set_kv_cache(self, kv_cache: TransformerDecoderKVCache):
         """Set the TransformerDecoderKVCache object managing the kv cache memory"""
-        raise NotImplementedError("TODO: Assignment5 - Task1")
+        self.decode_block.set_kv_cache(kv_cache)
     
     def reset_kv_cache(self):
         """Clear the cache memory and reset to the initial state"""
-        raise NotImplementedError("TODO: Assignment5 - Task1")
+        self.decode_block.reset_kv_cache()
+    
     
     def reset_parameters(self):
         """Initialize learnable parameters for Llama Model module"""
-        raise NotImplementedError("TODO: Assignment5 - Task1")
+        self.decode_block.reset_parameters()
     
     def load_parameters(self, params_files: Union[str, List[str]]) -> None:
         """Load pretrained params from the original LlamaForCausalLM
@@ -254,6 +319,7 @@ class LlamaModel(BaseModel):
             params_files(Union[str, List[str]]): path to the pretrained params file(s) of the original LlamaForCausalLM in .safetensors format
                 NOTE: if there're multiple params files, it is ensured that there is NO param name conflict
         """
+        
         raise NotImplementedError("TODO: Assignment5 - Task1")
     
     @staticmethod
@@ -269,7 +335,55 @@ class LlamaModel(BaseModel):
         Returns:
             LlamaConfig: a LlamaConfig object initialized from the config file
         """
-        raise NotImplementedError("TODO: Assignment5 - Task1")
+        config_dict = dict()
+        configs = load_json(config_file)
+        
+        # map original Llama Config to my config
+        for key, value in configs.items():
+            if key == "head_dim":
+                config_dict["head_dim"] = value
+            elif key == "hidden_act":
+                try:
+                    config_dict["activation_type"] = next((member for member in MLPActivationType if member.value == value))
+                except StopIteration:
+                    raise ValueError(f"Invalid activation function: {value}")
+            elif key == "hidden_size":
+                config_dict["hidden_size"] = value
+            elif key == "intermediate_size":
+                config_dict["ffh_size"] = value
+            elif key == "max_position_embeddings":
+                config_dict["max_seq_len"] = value
+            elif key == "num_attention_heads":
+                config_dict["num_q_head"] = value
+            elif key == "num_hidden_layers":
+                config_dict["num_layers"] = value
+            elif key == "num_key_value_heads":
+                config_dict["num_kv_head"] = value
+            elif key == "rms_norm_eps":
+                config_dict["eps"] = value
+            elif key == "rope_scaling":
+                config_dict["max_seq_len"] = value["original_max_position_embeddings"]
+            elif key == "rope_theta":
+                config_dict["rope_base"] = value
+            elif key == "tie_word_embeddings":
+                config_dict["lm_head_tied"] = value
+            elif key == "vocab_size":
+                config_dict["vocab_size"] = value
+            elif key == "torch_dtype":
+                if value == "bfloat16":
+                    config_dict["dtype"] = torch.bfloat16
+                elif value == "float16":
+                    config_dict["dtype"] = torch.float16
+                elif value == "float32":
+                    config_dict["dtype"] = torch.float32
+                else:
+                    raise ValueError(f"Invalid dtype: {value}")
+        
+        config_dict.update(**extra_configs)
+        
+        return LlamaConfig(**config_dict)
+                
+        
     
     def num_parameters(
         self,
@@ -285,7 +399,7 @@ class LlamaModel(BaseModel):
         Returns:
             float: the number of (learnable) parameters in the Llama Model module in the specified unit
         """
-        raise NotImplementedError("TODO: Assignment5 - Task1")
+        return self.decode_block.num_parameters(learnable_only=learnable_only, unit=unit)
     
     def num_memory_footprint(
         self,
@@ -300,5 +414,5 @@ class LlamaModel(BaseModel):
         Returns:
             float: the theoretical memory footprint of the Llama Model module's parameters in the specified unit
         """
-        raise NotImplementedError("TODO: Assignment5 - Task1")
+        return self.decode_block.num_memory_footprint(unit=unit)
     
